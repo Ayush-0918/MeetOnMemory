@@ -1,12 +1,13 @@
 import request from "supertest";
-import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import { jest } from "@jest/globals";
 import { app } from "../server.js";
+import { createClerkTestToken, authHeader } from "./helpers/clerkTestAuth.js";
 import User from "../models/userModel.js";
 import Organization from "../models/organizationModel.js";
 import Membership from "../models/membershipModel.js";
 import Invitation from "../models/invitationModel.js";
+import jwt from "jsonwebtoken";
 
 // Mock nodemailer to prevent SMTP verification during tests
 jest.mock("../config/nodeMailer.js", () => ({
@@ -23,6 +24,8 @@ describe("Organization Invitations & Member Onboarding", () => {
   let organization;
   let inviteUser;
   let inviteToken;
+  let expiredInviteeUser;
+  let expiredInviteeToken;
 
   beforeEach(async () => {
     // 1. Create Organization
@@ -41,10 +44,12 @@ describe("Organization Invitations & Member Onboarding", () => {
       role: "admin",
       isAccountVerified: true,
     });
-    adminToken = jwt.sign(
-      { id: adminUser._id },
-      process.env.JWT_SECRET || "fallback_secret",
-    );
+    adminUser.clerkUserId = `user_test_${adminUser._id}`;
+    await adminUser.save();
+    adminToken = createClerkTestToken({
+      clerkUserId: adminUser.clerkUserId,
+      email: adminUser.email,
+    });
 
     // Update organization owner link
     organization.owner = adminUser._id;
@@ -67,10 +72,12 @@ describe("Organization Invitations & Member Onboarding", () => {
       role: "member",
       isAccountVerified: true,
     });
-    normalToken = jwt.sign(
-      { id: normalUser._id },
-      process.env.JWT_SECRET || "fallback_secret",
-    );
+    normalUser.clerkUserId = `user_test_${normalUser._id}`;
+    await normalUser.save();
+    normalToken = createClerkTestToken({
+      clerkUserId: normalUser.clerkUserId,
+      email: normalUser.email,
+    });
 
     await Membership.create({
       user: normalUser._id,
@@ -90,13 +97,33 @@ describe("Organization Invitations & Member Onboarding", () => {
       { id: inviteUser._id },
       process.env.JWT_SECRET || "fallback_secret",
     );
+
+    // 5. Create expired invitee user for expiry tests
+    expiredInviteeUser = await User.create({
+      name: "Expired Invitee",
+      email: "expired_invitee@example.com",
+      password: "password123",
+      isAccountVerified: true,
+    });
+    expiredInviteeUser.clerkUserId = `user_test_${expiredInviteeUser._id}`;
+    await expiredInviteeUser.save();
+    expiredInviteeToken = createClerkTestToken({
+      clerkUserId: expiredInviteeUser.clerkUserId,
+      email: expiredInviteeUser.email,
+    });
+    inviteUser.clerkUserId = `user_test_${inviteUser._id}`;
+    await inviteUser.save();
+    inviteToken = createClerkTestToken({
+      clerkUserId: inviteUser.clerkUserId,
+      email: inviteUser.email,
+    });
   });
 
   describe("POST /api/invitation (Create Invitation)", () => {
     it("should allow admin to create an invitation", async () => {
       const res = await request(app)
         .post("/api/invitation")
-        .set("Authorization", `Bearer ${adminToken}`)
+        .set(authHeader(adminToken))
         .send({
           organizationId: organization._id,
           email: inviteUser.email,
@@ -115,7 +142,7 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should reject invitation if email is already active member", async () => {
       const res = await request(app)
         .post("/api/invitation")
-        .set("Authorization", `Bearer ${adminToken}`)
+        .set(authHeader(adminToken))
         .send({
           organizationId: organization._id,
           email: normalUser.email,
@@ -130,7 +157,7 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should prevent normal member from creating invitations", async () => {
       const res = await request(app)
         .post("/api/invitation")
-        .set("Authorization", `Bearer ${normalToken}`)
+        .set(authHeader(normalToken))
         .send({
           organizationId: organization._id,
           email: inviteUser.email,
@@ -158,7 +185,7 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should allow admin to list pending organization invitations", async () => {
       const res = await request(app)
         .get(`/api/invitation/organization/${organization._id}`)
-        .set("Authorization", `Bearer ${adminToken}`);
+        .set(authHeader(adminToken));
 
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
@@ -169,7 +196,7 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should restrict listing invitations to admins only", async () => {
       const res = await request(app)
         .get(`/api/invitation/organization/${organization._id}`)
-        .set("Authorization", `Bearer ${normalToken}`);
+        .set(authHeader(normalToken));
 
       expect(res.statusCode).toEqual(403);
     });
@@ -177,6 +204,7 @@ describe("Organization Invitations & Member Onboarding", () => {
 
   describe("POST /api/invitation/:token/accept (Accept invitation)", () => {
     let invitation;
+    let expiredInvitation;
 
     beforeEach(async () => {
       invitation = await Invitation.create({
@@ -188,12 +216,22 @@ describe("Organization Invitations & Member Onboarding", () => {
         status: "pending",
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       });
+
+      expiredInvitation = await Invitation.create({
+        organization: organization._id,
+        email: expiredInviteeUser.email,
+        invitedBy: adminUser._id,
+        token: "expired_accept_token_xyz",
+        role: "member",
+        status: "pending",
+        expiresAt: new Date(Date.now() - 1000), // expired
+      });
     });
 
     it("should allow invitee to accept invitation and join organization", async () => {
       const res = await request(app)
         .post(`/api/invitation/${invitation.token}/accept`)
-        .set("Authorization", `Bearer ${inviteToken}`);
+        .set(authHeader(inviteToken));
 
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
@@ -210,20 +248,47 @@ describe("Organization Invitations & Member Onboarding", () => {
 
       // Verify user model is updated
       const updatedUser = await User.findById(inviteUser._id);
-      expect(updatedUser.organization.toString()).toBe(organization._id.toString());
+      expect(updatedUser.organization.toString()).toBe(
+        organization._id.toString(),
+      );
     });
 
     it("should reject accept requests from other users", async () => {
       const res = await request(app)
         .post(`/api/invitation/${invitation.token}/accept`)
-        .set("Authorization", `Bearer ${normalToken}`); // normalUser has different email
+        .set(authHeader(normalToken)); // normalUser has different email
 
       expect(res.statusCode).toEqual(403);
+    });
+
+    it("should reject accepting an expired invitation", async () => {
+      const res = await request(app)
+        .post(`/api/invitation/${expiredInvitation.token}/accept`)
+        .set(authHeader(expiredInviteeToken));
+
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe("Invitation has expired.");
+
+      // Verify the invitation status was updated to expired
+      const updatedInvitation = await Invitation.findById(
+        expiredInvitation._id,
+      );
+      expect(updatedInvitation.status).toBe("expired");
+
+      // Verify no membership was created
+      const m = await Membership.findOne({
+        user: expiredInviteeUser._id,
+        organization: organization._id,
+        status: "active",
+      });
+      expect(m).toBeNull();
     });
   });
 
   describe("POST /api/invitation/:token/reject (Decline invitation)", () => {
     let invitation;
+    let expiredInvitation;
 
     beforeEach(async () => {
       invitation = await Invitation.create({
@@ -235,16 +300,42 @@ describe("Organization Invitations & Member Onboarding", () => {
         status: "pending",
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       });
+
+      expiredInvitation = await Invitation.create({
+        organization: organization._id,
+        email: expiredInviteeUser.email,
+        invitedBy: adminUser._id,
+        token: "expired_reject_token_xyz",
+        role: "member",
+        status: "pending",
+        expiresAt: new Date(Date.now() - 1000), // expired
+      });
     });
 
     it("should allow invitee to decline invitation", async () => {
       const res = await request(app)
         .post(`/api/invitation/${invitation.token}/reject`)
-        .set("Authorization", `Bearer ${inviteToken}`);
+        .set(authHeader(inviteToken));
 
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
       expect(res.body.invitation.status).toBe("declined");
+    });
+
+    it("should reject declining an expired invitation", async () => {
+      const res = await request(app)
+        .post(`/api/invitation/${expiredInvitation.token}/reject`)
+        .set(authHeader(expiredInviteeToken));
+
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe("Invitation has expired.");
+
+      // Verify the invitation status was updated to expired
+      const updatedInvitation = await Invitation.findById(
+        expiredInvitation._id,
+      );
+      expect(updatedInvitation.status).toBe("expired");
     });
   });
 
@@ -266,7 +357,7 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should allow admin to cancel invitation", async () => {
       const res = await request(app)
         .delete(`/api/invitation/${invitation._id}`)
-        .set("Authorization", `Bearer ${adminToken}`);
+        .set(authHeader(adminToken));
 
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
@@ -292,7 +383,7 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should allow admin to resend invitation and update token/expiry", async () => {
       const res = await request(app)
         .post(`/api/invitation/${invitation._id}/resend`)
-        .set("Authorization", `Bearer ${adminToken}`);
+        .set(authHeader(adminToken));
 
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
@@ -320,11 +411,126 @@ describe("Organization Invitations & Member Onboarding", () => {
     it("should allow admin to manually expire invitation", async () => {
       const res = await request(app)
         .post(`/api/invitation/${invitation._id}/expire`)
-        .set("Authorization", `Bearer ${adminToken}`);
+        .set(authHeader(adminToken));
 
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
       expect(res.body.invitation.status).toBe("expired");
+    });
+  });
+
+  describe("GET /api/invitation/:token (Get invitation by token)", () => {
+    let validInvitation;
+    let expiredInvitation;
+    let boundaryInvitation;
+
+    beforeEach(async () => {
+      // Create a valid invitation
+      validInvitation = await Invitation.create({
+        organization: organization._id,
+        email: inviteUser.email,
+        invitedBy: adminUser._id,
+        token: "valid_token_abc",
+        role: "member",
+        status: "pending",
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // expires in 24 hours
+      });
+
+      // Create an expired invitation
+      expiredInvitation = await Invitation.create({
+        organization: organization._id,
+        email: expiredInviteeUser.email,
+        invitedBy: adminUser._id,
+        token: "expired_token_def",
+        role: "member",
+        status: "pending",
+        expiresAt: new Date(Date.now() - 1000), // expired 1 second ago
+      });
+
+      // Create a boundary case invitation (just expired)
+      boundaryInvitation = await Invitation.create({
+        organization: organization._id,
+        email: `boundary-${Math.random()}@example.com`,
+        invitedBy: adminUser._id,
+        token: "boundary_token_ghi",
+        role: "member",
+        status: "pending",
+        expiresAt: new Date(Date.now() - 1), // just expired (1ms ago)
+      });
+    });
+
+    it("should return invitation details for valid, non-expired invitation", async () => {
+      const res = await request(app).get(
+        `/api/invitation/${validInvitation.token}`,
+      );
+
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.invitation.token).toBe(validInvitation.token);
+      expect(res.body.invitation.email).toBe(inviteUser.email);
+      expect(res.body.invitation.status).toBe("pending");
+      expect(res.body.invitation.organization).toBeDefined();
+    });
+
+    it("should return 400 for expired invitation", async () => {
+      const res = await request(app).get(
+        `/api/invitation/${expiredInvitation.token}`,
+      );
+
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe("Invitation has expired.");
+
+      // Verify the invitation status was updated to expired
+      const updatedInvitation = await Invitation.findById(
+        expiredInvitation._id,
+      );
+      expect(updatedInvitation.status).toBe("expired");
+    });
+
+    it("should return 400 for boundary case (just expired) invitation", async () => {
+      const res = await request(app).get(
+        `/api/invitation/${boundaryInvitation.token}`,
+      );
+
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe("Invitation has expired.");
+
+      // Verify the invitation status was updated to expired
+      const updatedInvitation = await Invitation.findById(
+        boundaryInvitation._id,
+      );
+      expect(updatedInvitation.status).toBe("expired");
+    });
+
+    it("should return 404 for non-existent invitation token", async () => {
+      const res = await request(app).get("/api/invitation/nonexistent_token");
+
+      expect(res.statusCode).toEqual(404);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe("Invitation not found.");
+    });
+
+    it("should return 400 for invitation with non-pending status", async () => {
+      // Create an accepted invitation
+      const acceptedInvitation = await Invitation.create({
+        organization: organization._id,
+        email: `accepted-${Math.random()}@example.com`,
+        invitedBy: adminUser._id,
+        token: "accepted_token_jkl",
+        role: "member",
+        status: "accepted",
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      });
+
+      const res = await request(app).get(
+        `/api/invitation/${acceptedInvitation.token}`,
+      );
+
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe("Invitation is not in pending status.");
     });
   });
 });
